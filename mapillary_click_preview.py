@@ -33,6 +33,20 @@ MAPILLARY_LAUNCH_YEAR = 2012
 MAPILLARY_LAYER_NAMES = {'Mapillary image', 'Mapillary sequence'}
 BUILDINGS_LAYER_NAME = 'OSM Buildings'
 
+# Overpass mirrors tried in order. overpass-api.de will 406 requests that don't
+# send an Accept header / proper form content-type, and it also rate-limits
+# heavily, so we send correct headers and fail over to mirrors automatically.
+_OVERPASS_ENDPOINTS = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter',
+    'https://overpass.openstreetmap.ru/api/interpreter',
+]
+_OVERPASS_HEADERS = {
+    'User-Agent': 'MapillaryClickPreview-QGIS-Plugin/1.0 (+https://github.com/RKsGIS/MapillaryClickPreview)',
+    'Accept': 'application/json',
+    'Content-Type': 'application/x-www-form-urlencoded',
+}
+
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -113,27 +127,49 @@ def _build_year_filter_expr(from_year, to_year):
 
 def _build_overpass_query(bounds):
     xmin, ymin, xmax, ymax = bounds
+    # "out geom;" is enough (skips tags/ids we don't use) and is noticeably
+    # lighter/faster than "out body geom;" for large building-dense areas.
     return f"""
 [out:json][timeout:25];
 (
   way["building"]({ymin},{xmin},{ymax},{xmax});
 );
-out body geom;
+out geom;
 """
 
 
 def _fetch_osm_buildings_layer(bounds):
-    """Fetch building footprints (ways only) from Overpass API for the given WGS84 bounds."""
-    query = _build_overpass_query(bounds)
-    resp = requests.post(
-        'https://overpass-api.de/api/interpreter',
-        data={'data': query},
-        proxies=_get_proxies(),
-        timeout=60,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    """Fetch building footprints (ways only) from Overpass API for the given WGS84 bounds.
 
+    Tries several public Overpass mirrors in turn (with a browser-like User-Agent,
+    which overpass-api.de requires — its absence is the usual cause of a 406
+    'Not Acceptable' response) and returns the first successful result.
+    """
+    query = _build_overpass_query(bounds)
+    proxies = _get_proxies()
+
+    last_error = None
+    for endpoint in _OVERPASS_ENDPOINTS:
+        try:
+            resp = requests.post(
+                endpoint,
+                data={'data': query},
+                headers=_OVERPASS_HEADERS,
+                proxies=proxies,
+                timeout=60,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return _osm_json_to_layer(data), endpoint
+        except Exception as e:
+            last_error = e
+            QgsMessageLog.logMessage(f'Overpass endpoint failed ({endpoint}): {e}', 'Mapillary', Qgis.Warning)
+            continue
+
+    raise RuntimeError(f'All Overpass endpoints failed: {last_error}')
+
+
+def _osm_json_to_layer(data):
     layer = QgsVectorLayer('Polygon?crs=EPSG:4326', BUILDINGS_LAYER_NAME, 'memory')
     prov = layer.dataProvider()
 
@@ -385,10 +421,15 @@ class MapillaryClickPreviewPlugin:
             return
 
         try:
-            buildings = _fetch_osm_buildings_layer(bounds)
-            if buildings.isValid():
+            buildings, endpoint = _fetch_osm_buildings_layer(bounds)
+            if buildings.isValid() and buildings.featureCount() > 0:
+                self._remove_buildings_layers()
                 QgsProject.instance().addMapLayer(buildings)
-                QgsMessageLog.logMessage('OSM buildings loaded.', 'Mapillary', Qgis.Info)
+                QgsMessageLog.logMessage(
+                    f'OSM buildings loaded via {endpoint} ({buildings.featureCount()} features).',
+                    'Mapillary', Qgis.Info)
+            elif buildings.isValid():
+                QgsMessageLog.logMessage('No buildings found for current extent/AOI.', 'Mapillary', Qgis.Info)
             else:
                 QgsMessageLog.logMessage('OSM buildings layer is invalid.', 'Mapillary', Qgis.Warning)
         except Exception as e:
