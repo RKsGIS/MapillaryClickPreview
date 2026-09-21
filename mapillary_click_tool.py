@@ -4,6 +4,7 @@
 # Exposes: activate_click_tool(), deactivate_click_tool(show_message=True),
 #          preview_selected_feature(), enable_auto_identify_preview(), disable_auto_identify_preview()
 
+import math
 from datetime import datetime, timezone
 import json
 import urllib.error
@@ -11,8 +12,9 @@ import urllib.parse
 import urllib.request
 
 from qgis.PyQt.QtCore import QEvent, QObject, Qt
-from qgis.PyQt.QtGui import QPixmap
+from qgis.PyQt.QtGui import QColor, QPixmap
 from qgis.PyQt.QtWidgets import QDockWidget, QLabel, QVBoxLayout, QWidget
+from qgis.PyQt import sip
 from qgis.core import (
     QgsCoordinateTransform,
     QgsFeatureRequest,
@@ -22,8 +24,9 @@ from qgis.core import (
     QgsRectangle,
     QgsSettings,
     QgsVectorLayer,
+    QgsWkbTypes,
 )
-from qgis.gui import QgsMapToolEmitPoint
+from qgis.gui import QgsMapToolEmitPoint, QgsRubberBand, QgsVertexMarker
 from qgis.utils import iface
 
 _qsettings = QgsSettings()
@@ -34,10 +37,15 @@ MAPILLARY_ID_FIELD = 'id'
 FEATURE_PICK_TOLERANCE_PX = 8
 THUMB_MAX_W, THUMB_MAX_H = 900, 600
 ALLOWED_REMOTE_URL_SCHEME = 'https'
+MARKER_COLOR = QColor(255, 0, 0)
+ARROW_LENGTH_PX = 40
 
 canvas = None
 project = None
 preview = None
+
+_click_marker = None
+_click_arrow = None
 
 
 class _MapillaryIdentifyClickFilter(QObject):
@@ -68,10 +76,11 @@ class _MapillaryIdentifyClickFilter(QObject):
                 return False
 
             _ensure_infrastructure()
+            _show_marker(map_point)
             preview['status_label'].setText(f'Identify: Mapillary image {image_id} gevonden...')
             preview['meta_label'].setText('')
             preview['link_label'].setText('')
-            _fetch_and_render_image_id(image_id)
+            _fetch_and_render_image_id(image_id, map_point)
         except Exception:
             return False
 
@@ -348,7 +357,68 @@ def _set_fallback_link(image_id):
     )
 
 
-def _fetch_and_render_image_id(image_id):
+def _clear_marker():
+    """Remove the click marker and direction arrow from the canvas, if present."""
+    global _click_marker, _click_arrow
+
+    if _click_marker is not None:
+        try:
+            if canvas is not None:
+                canvas.scene().removeItem(_click_marker)
+        except Exception:
+            pass
+        _click_marker = None
+
+    if _click_arrow is not None:
+        try:
+            _click_arrow.reset(QgsWkbTypes.LineGeometry)
+        except Exception:
+            pass
+        _click_arrow = None
+
+
+def _show_marker(map_point, compass_deg=None):
+    """Draw a marker at the clicked point and, when known, an arrow for the camera direction."""
+    global _click_marker, _click_arrow
+
+    _ensure_canvas_project()
+    _clear_marker()
+
+    try:
+        marker = QgsVertexMarker(canvas)
+        marker.setCenter(map_point)
+        marker.setColor(MARKER_COLOR)
+        marker.setFillColor(MARKER_COLOR)
+        marker.setIconType(QgsVertexMarker.ICON_CIRCLE)
+        marker.setIconSize(12)
+        marker.setPenWidth(3)
+        _click_marker = marker
+    except Exception:
+        _click_marker = None
+
+    if compass_deg is not None:
+        try:
+            arrow_length = float(canvas.mapUnitsPerPixel()) * ARROW_LENGTH_PX
+            angle_rad = math.radians(compass_deg)
+            end_x = map_point.x() + arrow_length * math.sin(angle_rad)
+            end_y = map_point.y() + arrow_length * math.cos(angle_rad)
+
+            rb = QgsRubberBand(canvas, QgsWkbTypes.LineGeometry)
+            rb.addPoint(map_point)
+            rb.addPoint(QgsPointXY(end_x, end_y))
+            rb.setColor(MARKER_COLOR)
+            rb.setWidth(3)
+            _click_arrow = rb
+        except Exception:
+            _click_arrow = None
+
+
+def _update_marker_direction(map_point, compass_deg):
+    """Redraw the arrow once the camera compass angle is known (after the API call)."""
+    _show_marker(map_point, compass_deg)
+
+
+def _fetch_and_render_image_id(image_id, map_point=None):
     preview['status_label'].setText(f'Mapillary image {image_id} ophalen...')
 
     try:
@@ -366,6 +436,9 @@ def _fetch_and_render_image_id(image_id):
         set_preview_empty(preview, f'Fout bij ophalen Mapillary image {image_id}: {exc}')
         _set_fallback_link(image_id)
         return
+
+    if map_point is not None:
+        _update_marker_direction(map_point, result.get('compass'))
 
     set_preview_result(preview, result)
 
@@ -399,7 +472,7 @@ def create_preview_panel():
     layout = QVBoxLayout(container)
     layout.setContentsMargins(8, 8, 8, 8)
 
-    status_label = QLabel("Klik/selecteer/identify een Mapillary image-feature om direct preview te laden. Rechterklik: click-only mode stoppen.")
+    status_label = QLabel("Klik op een Mapillary image-feature om direct preview te laden. Rechterklik: click-only mode stoppen.")
     status_label.setWordWrap(True)
     layout.addWidget(status_label)
 
@@ -467,17 +540,37 @@ def set_preview_result(preview_panel, result):
         preview_panel['link_label'].setText('')
 
 
+def _preview_is_valid():
+    """Guard against 'wrapped C/C++ object has been deleted' when QGIS tears down the dock."""
+    if preview is None:
+        return False
+    dock = preview.get('dock')
+    if dock is None:
+        return False
+    try:
+        if sip.isdeleted(dock):
+            return False
+        for key in ('status_label', 'image_label', 'meta_label', 'link_label'):
+            widget = preview.get(key)
+            if widget is None or sip.isdeleted(widget):
+                return False
+    except Exception:
+        return False
+    return True
+
+
 def _ensure_infrastructure():
     global preview
 
     _ensure_canvas_project()
 
-    if preview is None:
+    if not _preview_is_valid():
         preview = create_preview_panel()
 
 
 def deactivate_click_tool(show_message=True):
     _ensure_infrastructure()
+    _clear_marker()
 
     click_tool = globals().get('_MAPILLARY_CLICK_TOOL')
     click_handler = globals().get('_MAPILLARY_CLICK_HANDLER')
@@ -508,7 +601,7 @@ def deactivate_click_tool(show_message=True):
     globals()['_MAPILLARY_CLICK_HANDLER'] = None
     globals()['_MAPILLARY_PREV_TOOL'] = None
 
-    if show_message and preview is not None:
+    if show_message and _preview_is_valid():
         if restored:
             preview['status_label'].setText('Click-only mode gestopt. Vorig kaartgereedschap is hersteld.')
         else:
@@ -534,10 +627,12 @@ def on_canvas_clicked(map_point, mouse_button):
     try:
         image_id = _find_clicked_image_id(map_point)
     except Exception as exc:
+        _clear_marker()
         set_preview_empty(preview, f'Kon geen bruikbare id uit laag \"Mapillary image\" lezen: {exc}')
         return
 
-    _fetch_and_render_image_id(image_id)
+    _show_marker(map_point)
+    _fetch_and_render_image_id(image_id, map_point)
 
 
 def preview_selected_feature():
@@ -551,10 +646,22 @@ def preview_selected_feature():
         layer, id_index = _get_layer_and_id_index()
         image_id = _selected_image_id_or_error(layer, id_index)
     except Exception as exc:
+        _clear_marker()
         set_preview_empty(preview, f'Kan geselecteerde feature niet gebruiken: {exc}')
         return
 
-    _fetch_and_render_image_id(image_id)
+    map_point = None
+    try:
+        selected = layer.selectedFeatures()
+        geom = selected[-1].geometry() if selected else None
+        if geom is not None and not geom.isEmpty():
+            layer_point = geom.asPoint()
+            map_point = _transform_point(layer_point, layer.crs(), project.crs())
+            _show_marker(map_point)
+    except Exception:
+        map_point = None
+
+    _fetch_and_render_image_id(image_id, map_point)
 
 
 def activate_click_tool():
@@ -586,9 +693,8 @@ def activate_click_tool():
     click_tool.canvasClicked.connect(on_canvas_clicked)
     canvas.setMapTool(click_tool)
 
-    if preview is not None:
-        preview['status_label'].setText("Click-only mode actief. Klik op een Mapillary image-feature (of gebruik Preview Selected). Rechterklik: stoppen en vorig tool herstellen.")
+    if _preview_is_valid():
+        preview['status_label'].setText("Click-only mode actief. Links klikken op een Mapillary image-feature = zoeken. Rechtsklikken = stoppen en vorig tool herstellen.")
 
     globals()['_MAPILLARY_CLICK_TOOL'] = click_tool
     globals()['_MAPILLARY_CLICK_HANDLER'] = on_canvas_clicked
-    
