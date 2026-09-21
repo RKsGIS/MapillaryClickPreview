@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 # QGIS Plugin: Mapillary Click Preview (button-triggered coverage + OSM buildings)
 
+import hashlib
+import json
 import math
 import os
 import tempfile
@@ -33,19 +35,32 @@ MAPILLARY_LAUNCH_YEAR = 2012
 MAPILLARY_LAYER_NAMES = {'Mapillary image', 'Mapillary sequence'}
 BUILDINGS_LAYER_NAME = 'OSM Buildings'
 
-# Overpass mirrors tried in order. overpass-api.de will 406 requests that don't
-# send an Accept header / proper form content-type, and it also rate-limits
-# heavily, so we send correct headers and fail over to mirrors automatically.
+# Public Overpass endpoints, tried in order until one responds. Large/global
+# instances (overpass-api.de) are frequently rate-limited or overloaded and
+# will 406/504/timeout under load; smaller regional mirrors are often faster
+# for a small bbox. Users can override this list via QGIS Settings if needed.
 _OVERPASS_ENDPOINTS = [
-    'https://overpass-api.de/api/interpreter',
     'https://overpass.kumi.systems/api/interpreter',
-    'https://overpass.openstreetmap.ru/api/interpreter',
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.private.coffee/api/interpreter',
+    'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
 ]
 _OVERPASS_HEADERS = {
     'User-Agent': 'MapillaryClickPreview-QGIS-Plugin/1.0 (+https://github.com/RKsGIS/MapillaryClickPreview)',
     'Accept': 'application/json',
     'Content-Type': 'application/x-www-form-urlencoded',
 }
+_OVERPASS_REQUEST_TIMEOUT = 25  # seconds per endpoint attempt
+_OVERPASS_QUERY_TIMEOUT = 20    # seconds passed inside the Overpass QL query itself
+
+# Overpass (and most bbox-based OSM services) get slow/likely to time out once
+# the requested area gets large. Building queries in particular can return a
+# huge number of ways, so we cap the AOI/extent size and ask the user to zoom
+# in or draw a smaller selection instead of silently hammering the servers.
+MAX_BUILDINGS_BBOX_DEG = 0.03  # ~roughly 3 km at the equator
+
+BUILDINGS_CACHE_EXPIRE_HOURS = 24
+_BUILDINGS_CACHE_EXPIRE = timedelta(hours=BUILDINGS_CACHE_EXPIRE_HOURS)
 
 
 # --------------------------------------------------------------------------
@@ -127,24 +142,57 @@ def _build_year_filter_expr(from_year, to_year):
 
 def _build_overpass_query(bounds):
     xmin, ymin, xmax, ymax = bounds
-    # "out geom;" is enough (skips tags/ids we don't use) and is noticeably
-    # lighter/faster than "out body geom;" for large building-dense areas.
-    return f"""
-[out:json][timeout:25];
-(
-  way["building"]({ymin},{xmin},{ymax},{xmax});
-);
-out geom;
-"""
+    # "out geom;" (no tags/ids) is enough for footprints and is noticeably
+    # lighter/faster than "out body geom;" for building-dense areas.
+    return (
+        f'[out:json][timeout:{_OVERPASS_QUERY_TIMEOUT}];'
+        f'(way["building"]({ymin},{xmin},{ymax},{xmax}););'
+        f'out geom;'
+    )
+
+
+def _buildings_cache_path(bounds):
+    cache_dir = os.path.join(tempfile.gettempdir(), 'go2mapillary', 'osm_buildings')
+    os.makedirs(cache_dir, exist_ok=True)
+    key = '_'.join(f'{v:.4f}' for v in bounds)
+    digest = hashlib.md5(key.encode('utf-8')).hexdigest()
+    return os.path.join(cache_dir, f'{digest}.json')
+
+
+def _read_buildings_cache(bounds):
+    path = _buildings_cache_path(bounds)
+    if not os.path.exists(path):
+        return None
+    if datetime.fromtimestamp(os.path.getmtime(path)) < (datetime.now() - _BUILDINGS_CACHE_EXPIRE):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _write_buildings_cache(bounds, data):
+    try:
+        with open(_buildings_cache_path(bounds), 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+    except Exception:
+        pass
 
 
 def _fetch_osm_buildings_layer(bounds):
     """Fetch building footprints (ways only) from Overpass API for the given WGS84 bounds.
 
-    Tries several public Overpass mirrors in turn (with a browser-like User-Agent,
-    which overpass-api.de requires — its absence is the usual cause of a 406
-    'Not Acceptable' response) and returns the first successful result.
+    Tries several public Overpass mirrors in turn with a proper User-Agent
+    (its absence is the usual cause of a 406 'Not Acceptable' from
+    overpass-api.de) and a short per-endpoint timeout, since the public
+    instances are frequently overloaded. Results are cached on disk for a
+    while so repeated requests for the same area are instant.
     """
+    cached = _read_buildings_cache(bounds)
+    if cached is not None:
+        return _osm_json_to_layer(cached), 'cache'
+
     query = _build_overpass_query(bounds)
     proxies = _get_proxies()
 
@@ -156,10 +204,11 @@ def _fetch_osm_buildings_layer(bounds):
                 data={'data': query},
                 headers=_OVERPASS_HEADERS,
                 proxies=proxies,
-                timeout=60,
+                timeout=_OVERPASS_REQUEST_TIMEOUT,
             )
             resp.raise_for_status()
             data = resp.json()
+            _write_buildings_cache(bounds, data)
             return _osm_json_to_layer(data), endpoint
         except Exception as e:
             last_error = e
@@ -420,20 +469,33 @@ class MapillaryClickPreviewPlugin:
             QgsMessageLog.logMessage('No valid extent/AOI to load buildings for.', 'Mapillary', Qgis.Warning)
             return
 
+        width = abs(bounds[2] - bounds[0])
+        height = abs(bounds[3] - bounds[1])
+        if width > MAX_BUILDINGS_BBOX_DEG or height > MAX_BUILDINGS_BBOX_DEG:
+            QgsMessageLog.logMessage(
+                'Area too large for OSM buildings lookup. Zoom in further or select a smaller '
+                f'area (max ~{MAX_BUILDINGS_BBOX_DEG}° per side) to avoid Overpass timeouts.',
+                'Mapillary', Qgis.Warning)
+            return
+
         try:
-            buildings, endpoint = _fetch_osm_buildings_layer(bounds)
+            buildings, source = _fetch_osm_buildings_layer(bounds)
             if buildings.isValid() and buildings.featureCount() > 0:
                 self._remove_buildings_layers()
                 QgsProject.instance().addMapLayer(buildings)
                 QgsMessageLog.logMessage(
-                    f'OSM buildings loaded via {endpoint} ({buildings.featureCount()} features).',
+                    f'OSM buildings loaded via {source} ({buildings.featureCount()} features).',
                     'Mapillary', Qgis.Info)
             elif buildings.isValid():
                 QgsMessageLog.logMessage('No buildings found for current extent/AOI.', 'Mapillary', Qgis.Info)
             else:
                 QgsMessageLog.logMessage('OSM buildings layer is invalid.', 'Mapillary', Qgis.Warning)
         except Exception as e:
-            QgsMessageLog.logMessage(f'Failed to load OSM buildings: {e}', 'Mapillary', Qgis.Warning)
+            QgsMessageLog.logMessage(
+                f'Failed to load OSM buildings: {e}. Public Overpass servers may be busy — '
+                'try again in a moment, zoom in to shrink the area, or install the QuickOSM '
+                'plugin for more download options.',
+                'Mapillary', Qgis.Warning)
 
     def _clear_all_layers(self):
         self._remove_coverage_layers()
