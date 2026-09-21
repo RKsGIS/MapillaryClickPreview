@@ -1,11 +1,11 @@
-
 # -*- coding: utf-8 -*-
-# QGIS Plugin: Mapillary Click Preview (toggle button + add coverage VTP layer)
+# QGIS Plugin: Mapillary Click Preview (button-triggered coverage + OSM buildings)
 
 import math
 import os
 import tempfile
 from datetime import datetime, timedelta, timezone
+
 import requests
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import (
@@ -14,7 +14,7 @@ from qgis.PyQt.QtWidgets import (
 from qgis.core import (
     QgsSettings, QgsProject, QgsVectorLayer,
     QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsPointXY,
-    QgsMessageLog, Qgis,
+    QgsMessageLog, Qgis, QgsFeature, QgsGeometry,
 )
 
 from . import mapillary_click_tool as tool
@@ -30,6 +30,13 @@ _CACHE_EXPIRE = timedelta(hours=CACHE_EXPIRE_HOURS)
 MAX_WEB_MERCATOR_LAT = 85.05112878
 MAPILLARY_LAUNCH_YEAR = 2012
 
+MAPILLARY_LAYER_NAMES = {'Mapillary image', 'Mapillary sequence'}
+BUILDINGS_LAYER_NAME = 'OSM Buildings'
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
 
 def _is_finite_number(value):
     try:
@@ -97,6 +104,62 @@ def _extend_layer(target, source, name):
     return target
 
 
+def _build_year_filter_expr(from_year, to_year):
+    """QGIS expression that filters coverage features by captured_at year range."""
+    start_ms = int(datetime(from_year, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+    end_ms = int(datetime(to_year + 1, 1, 1, tzinfo=timezone.utc).timestamp() * 1000) - 1
+    return f'captured_at IS NULL OR (captured_at >= {start_ms} AND captured_at <= {end_ms})'
+
+
+def _build_overpass_query(bounds):
+    xmin, ymin, xmax, ymax = bounds
+    return f"""
+[out:json][timeout:25];
+(
+  way["building"]({ymin},{xmin},{ymax},{xmax});
+);
+out body geom;
+"""
+
+
+def _fetch_osm_buildings_layer(bounds):
+    """Fetch building footprints (ways only) from Overpass API for the given WGS84 bounds."""
+    query = _build_overpass_query(bounds)
+    resp = requests.post(
+        'https://overpass-api.de/api/interpreter',
+        data={'data': query},
+        proxies=_get_proxies(),
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    layer = QgsVectorLayer('Polygon?crs=EPSG:4326', BUILDINGS_LAYER_NAME, 'memory')
+    prov = layer.dataProvider()
+
+    features = []
+    for el in data.get('elements', []):
+        if el.get('type') != 'way':
+            continue
+        geom = el.get('geometry')
+        if not geom:
+            continue
+        coords = [QgsPointXY(pt['lon'], pt['lat']) for pt in geom]
+        if len(coords) < 3:
+            continue
+        feat = QgsFeature()
+        feat.setGeometry(QgsGeometry.fromPolygonXY([coords]))
+        features.append(feat)
+
+    prov.addFeatures(features)
+    layer.updateExtents()
+    return layer
+
+
+# --------------------------------------------------------------------------
+# Dialogs
+# --------------------------------------------------------------------------
+
 class TokenDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -122,13 +185,6 @@ class TokenDialog(QDialog):
         s = QgsSettings()
         s.setValue('mapillary/access_token', self.edit.text().strip())
         self.accept()
-
-
-def _build_year_filter_expr(from_year, to_year):
-    """QGIS expression that filters coverage features by captured_at year range."""
-    start_ms = int(datetime(from_year, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
-    end_ms = int(datetime(to_year + 1, 1, 1, tzinfo=timezone.utc).timestamp() * 1000) - 1
-    return f'captured_at IS NULL OR (captured_at >= {start_ms} AND captured_at <= {end_ms})'
 
 
 class YearFilterDialog(QDialog):
@@ -177,19 +233,34 @@ class YearFilterDialog(QDialog):
         self.accept()
 
 
+# --------------------------------------------------------------------------
+# Plugin
+# --------------------------------------------------------------------------
+
 class MapillaryClickPreviewPlugin:
     def __init__(self, iface):
         self.iface = iface
-        self.action = None
-        self.settings_action = None
-        self.add_tiles_action = None
-        self.add_computed_tiles_action = None
-        self.filter_year_action = None
+
+        # Actions
+        self.action = None                     # toggle click-to-preview tool
+        self.settings_action = None             # set access token
+        self.add_tiles_action = None            # load Mapillary coverage (original)
+        self.add_computed_tiles_action = None   # load Mapillary coverage (computed)
+        self.filter_year_action = None          # open year-range filter dialog
+        self.filter_pano_action = None          # toggle "panoramas only"
+        self.add_buildings_action = None        # load OSM buildings for current view/AOI
+        self.clear_action = None                # remove all loaded layers
+
+        # State
         self.coverage_tile_set = None
         self.coverage_range_key = None
         self.coverage_layers = {level: None for level in LAYER_LEVELS}
         self.coverage_refreshing = False
         self._auto_preview_layer = None
+
+    # ------------------------------------------------------------------
+    # Setup / teardown
+    # ------------------------------------------------------------------
 
     def initGui(self):
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.svg')
@@ -197,46 +268,52 @@ class MapillaryClickPreviewPlugin:
 
         self.action = QAction(icon, 'Mapillary Click Preview', self.iface.mainWindow())
         self.action.setCheckable(True)
-        self.action.setToolTip('Toggle: Click-only mode aan/uit (links klikken = zoeken, rechts = stoppen)')
+        self.action.setToolTip('Toggle click-to-preview mode (left click = search, right click = stop)')
         self.action.toggled.connect(self._on_toggled)
 
         self.settings_action = QAction('Mapillary Token…', self.iface.mainWindow())
         self.settings_action.triggered.connect(self._open_settings)
 
         self.add_tiles_action = QAction('Load Mapillary Coverage (Original)', self.iface.mainWindow())
-        self.add_tiles_action.triggered.connect(
-            lambda: self._load_coverage('original', force=True))
+        self.add_tiles_action.triggered.connect(lambda: self._load_coverage('original', force=True))
 
         self.add_computed_tiles_action = QAction('Load Mapillary Coverage (Computed)', self.iface.mainWindow())
-        self.add_computed_tiles_action.triggered.connect(
-            lambda: self._load_coverage('computed', force=True))
+        self.add_computed_tiles_action.triggered.connect(lambda: self._load_coverage('computed', force=True))
+
+        self.filter_year_action = QAction('Filter Coverage by Year…', self.iface.mainWindow())
+        self.filter_year_action.triggered.connect(self._open_year_filter)
+
+        self.filter_pano_action = QAction('Show Only Panoramas', self.iface.mainWindow())
+        self.filter_pano_action.setCheckable(True)
+        self.filter_pano_action.setChecked(QgsSettings().value('mapillary/pano_only', False, type=bool))
+        self.filter_pano_action.toggled.connect(self._on_pano_filter_toggled)
+
+        self.add_buildings_action = QAction('Load OSM Buildings (Overpass)', self.iface.mainWindow())
+        self.add_buildings_action.triggered.connect(self._load_buildings)
+
+        self.clear_action = QAction('Clear All Loaded Layers', self.iface.mainWindow())
+        self.clear_action.triggered.connect(self._clear_all_layers)
 
         self.iface.addToolBarIcon(self.action)
         self.iface.addPluginToMenu('&Mapillary', self.action)
         self.iface.addPluginToMenu('&Mapillary', self.settings_action)
         self.iface.addPluginToMenu('&Mapillary', self.add_tiles_action)
         self.iface.addPluginToMenu('&Mapillary', self.add_computed_tiles_action)
-
-        self.filter_year_action = QAction('Filter Mapillary Coverage by Year…', self.iface.mainWindow())
-        self.filter_year_action.triggered.connect(self._open_year_filter)
         self.iface.addPluginToMenu('&Mapillary', self.filter_year_action)
+        self.iface.addPluginToMenu('&Mapillary', self.filter_pano_action)
+        self.iface.addPluginToMenu('&Mapillary', self.add_buildings_action)
+        self.iface.addPluginToMenu('&Mapillary', self.clear_action)
+
+        # NOTE: coverage loading is intentionally NOT tied to mapCanvasRefreshed.
+        # It only runs when the user explicitly triggers one of the "Load…" actions,
+        # to avoid re-downloading/re-rendering tiles on every pan/zoom.
 
         try:
             tool.enable_auto_identify_preview()
         except Exception as e:
             QgsMessageLog.logMessage(f'Could not enable auto identify preview: {e}', 'Mapillary', Qgis.Warning)
 
-        try:
-            self.iface.mapCanvas().mapCanvasRefreshed.connect(self._refresh_coverage_for_canvas)
-        except Exception:
-            pass
-
     def unload(self):
-        try:
-            self.iface.mapCanvas().mapCanvasRefreshed.disconnect(self._refresh_coverage_for_canvas)
-        except Exception:
-            pass
-
         try:
             if self.action:
                 self.iface.removeToolBarIcon(self.action)
@@ -249,6 +326,12 @@ class MapillaryClickPreviewPlugin:
                 self.iface.removePluginMenu('&Mapillary', self.add_computed_tiles_action)
             if self.filter_year_action:
                 self.iface.removePluginMenu('&Mapillary', self.filter_year_action)
+            if self.filter_pano_action:
+                self.iface.removePluginMenu('&Mapillary', self.filter_pano_action)
+            if self.add_buildings_action:
+                self.iface.removePluginMenu('&Mapillary', self.add_buildings_action)
+            if self.clear_action:
+                self.iface.removePluginMenu('&Mapillary', self.clear_action)
         except Exception:
             pass
 
@@ -264,7 +347,11 @@ class MapillaryClickPreviewPlugin:
 
         self.coverage_tile_set = None
         self.coverage_range_key = None
-        self._remove_coverage_layers()
+        self._clear_all_layers()
+
+    # ------------------------------------------------------------------
+    # Action handlers
+    # ------------------------------------------------------------------
 
     def _on_toggled(self, checked):
         try:
@@ -281,11 +368,44 @@ class MapillaryClickPreviewPlugin:
         dlg.setModal(True)
         dlg.exec()
 
+    def _open_year_filter(self):
+        dlg = YearFilterDialog(self.iface.mainWindow())
+        dlg.setModal(True)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._apply_filters_to_existing_layers()
+
+    def _on_pano_filter_toggled(self, checked):
+        QgsSettings().setValue('mapillary/pano_only', checked)
+        self._apply_filters_to_existing_layers()
+
+    def _load_buildings(self):
+        bounds = self._get_active_aoi_bounds() or self._get_canvas_bounds()
+        if not bounds or not all(_is_finite_number(v) for v in bounds):
+            QgsMessageLog.logMessage('No valid extent/AOI to load buildings for.', 'Mapillary', Qgis.Warning)
+            return
+
+        try:
+            buildings = _fetch_osm_buildings_layer(bounds)
+            if buildings.isValid():
+                QgsProject.instance().addMapLayer(buildings)
+                QgsMessageLog.logMessage('OSM buildings loaded.', 'Mapillary', Qgis.Info)
+            else:
+                QgsMessageLog.logMessage('OSM buildings layer is invalid.', 'Mapillary', Qgis.Warning)
+        except Exception as e:
+            QgsMessageLog.logMessage(f'Failed to load OSM buildings: {e}', 'Mapillary', Qgis.Warning)
+
+    def _clear_all_layers(self):
+        self._remove_coverage_layers()
+        self._remove_buildings_layers()
+
+    # ------------------------------------------------------------------
+    # Auto-preview wiring (selecting a Mapillary image feature previews it)
+    # ------------------------------------------------------------------
+
     def _on_image_layer_selection_changed(self, selected, deselected, clear_and_select):
         layer = self._auto_preview_layer
         if layer is None:
             return
-
         try:
             if layer.selectedFeatureCount() <= 0:
                 return
@@ -296,12 +416,9 @@ class MapillaryClickPreviewPlugin:
     def _connect_auto_preview_layer(self, layer):
         if layer is self._auto_preview_layer:
             return
-
         self._disconnect_auto_preview_layer()
-
         if layer is None or not layer.isValid():
             return
-
         try:
             layer.selectionChanged.connect(self._on_image_layer_selection_changed)
             self._auto_preview_layer = layer
@@ -312,28 +429,18 @@ class MapillaryClickPreviewPlugin:
     def _disconnect_auto_preview_layer(self):
         if self._auto_preview_layer is None:
             return
-
         try:
             self._auto_preview_layer.selectionChanged.disconnect(self._on_image_layer_selection_changed)
         except Exception:
             pass
-
         self._auto_preview_layer = None
 
-    def _open_year_filter(self):
-        dlg = YearFilterDialog(self.iface.mainWindow())
-        dlg.setModal(True)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._apply_year_filter_to_existing_layers()
-
-    def _refresh_coverage_for_canvas(self):
-        if not self.coverage_tile_set or self.coverage_refreshing:
-            return
-        self._load_coverage(self.coverage_tile_set)
+    # ------------------------------------------------------------------
+    # Layer management
+    # ------------------------------------------------------------------
 
     def _remove_coverage_layers(self):
         self._disconnect_auto_preview_layer()
-
         for level in LAYER_LEVELS:
             layer = self.coverage_layers.get(level)
             if not layer:
@@ -344,27 +451,66 @@ class MapillaryClickPreviewPlugin:
                 pass
             self.coverage_layers[level] = None
 
-    def _apply_year_filter_to_existing_layers(self):
+    def _remove_buildings_layers(self):
+        for layer in list(QgsProject.instance().mapLayers().values()):
+            if isinstance(layer, QgsVectorLayer) and layer.name() == BUILDINGS_LAYER_NAME:
+                try:
+                    QgsProject.instance().removeMapLayer(layer.id())
+                except Exception:
+                    pass
+
+    def _apply_filters_to_existing_layers(self):
         s = QgsSettings()
-        enabled = s.value('mapillary/year_filter_enabled', False, type=bool)
+        year_enabled = s.value('mapillary/year_filter_enabled', False, type=bool)
+        pano_only = s.value('mapillary/pano_only', False, type=bool)
+
         year_expr = ''
-        if enabled:
+        if year_enabled:
             from_year = s.value('mapillary/year_filter_from', MAPILLARY_LAUNCH_YEAR, type=int)
             to_year = s.value('mapillary/year_filter_to', datetime.now().year, type=int)
             year_expr = _build_year_filter_expr(from_year, to_year)
 
-        target_layer_names = {'Mapillary image', 'Mapillary sequence'}
-
         for layer in QgsProject.instance().mapLayers().values():
-            if not (isinstance(layer, QgsVectorLayer) and layer.name() in target_layer_names):
+            if not (isinstance(layer, QgsVectorLayer) and layer.name() in MAPILLARY_LAYER_NAMES):
                 continue
 
-            subset = ''
-            if enabled and layer.fields().lookupField('captured_at') != -1:
-                subset = year_expr
+            subset_parts = []
+            if year_enabled and layer.fields().lookupField('captured_at') != -1:
+                subset_parts.append(f'({year_expr})')
+            if pano_only and layer.fields().lookupField('is_pano') != -1:
+                subset_parts.append('("is_pano" = true)')
 
-            layer.setSubsetString(subset)
+            layer.setSubsetString(' AND '.join(subset_parts))
             layer.triggerRepaint()
+
+    # ------------------------------------------------------------------
+    # AOI / extent helpers
+    # ------------------------------------------------------------------
+
+    def _get_active_aoi_bounds(self):
+        """Use the extent of the selected feature(s) in the active layer as AOI, if any."""
+        layer = self.iface.activeLayer()
+        if isinstance(layer, QgsVectorLayer) and layer.selectedFeatureCount() > 0:
+            box = layer.boundingBoxOfSelected()
+            xform = QgsCoordinateTransform(layer.crs(), QgsCoordinateReferenceSystem(4326), QgsProject.instance())
+            box = xform.transformBoundingBox(box)
+            return (box.xMinimum(), box.yMinimum(), box.xMaximum(), box.yMaximum())
+        return None
+
+    def _get_canvas_bounds(self):
+        canvas = self.iface.mapCanvas()
+        crs_src = canvas.mapSettings().destinationCrs()
+        crs_wgs84 = QgsCoordinateReferenceSystem(4326)
+        xform = QgsCoordinateTransform(crs_src, crs_wgs84, QgsProject.instance())
+
+        ex = canvas.extent()
+        wgs84_min = xform.transform(QgsPointXY(ex.xMinimum(), ex.yMinimum()))
+        wgs84_max = xform.transform(QgsPointXY(ex.xMaximum(), ex.yMaximum()))
+        return (wgs84_min.x(), wgs84_min.y(), wgs84_max.x(), wgs84_max.y())
+
+    # ------------------------------------------------------------------
+    # Mapillary coverage loading (only runs when explicitly triggered)
+    # ------------------------------------------------------------------
 
     def _load_coverage(self, tile_set='original', force=False):
         s = QgsSettings()
@@ -379,23 +525,18 @@ class MapillaryClickPreviewPlugin:
         server_url = _SERVER_URLS[tile_set].replace('{token}', token)
 
         canvas = self.iface.mapCanvas()
-        crs_src = canvas.mapSettings().destinationCrs()
-        crs_wgs84 = QgsCoordinateReferenceSystem(4326)
-        xform = QgsCoordinateTransform(crs_src, crs_wgs84, QgsProject.instance())
-
-        ex = canvas.extent()
-        wgs84_min = xform.transform(QgsPointXY(ex.xMinimum(), ex.yMinimum()))
-        wgs84_max = xform.transform(QgsPointXY(ex.xMaximum(), ex.yMaximum()))
-        bounds = (wgs84_min.x(), wgs84_min.y(), wgs84_max.x(), wgs84_max.y())
+        aoi = self._get_active_aoi_bounds()
+        bounds = aoi if aoi else self._get_canvas_bounds()
 
         if not all(_is_finite_number(v) for v in bounds):
-            QgsMessageLog.logMessage('Canvas extent is not valid for tile loading.', 'Mapillary', Qgis.Warning)
+            QgsMessageLog.logMessage('Extent/AOI is not valid for tile loading.', 'Mapillary', Qgis.Warning)
             return
 
         canvas_width = canvas.width()
         if canvas_width <= 0:
             return
-        map_units_per_pixel = abs(wgs84_max.x() - wgs84_min.x()) / canvas_width
+
+        map_units_per_pixel = abs(bounds[2] - bounds[0]) / canvas_width
         zoom_level = _zoom_for_pixel_size(map_units_per_pixel)
         zoom_level = max(0, min(int(zoom_level), 14))
 
@@ -421,7 +562,8 @@ class MapillaryClickPreviewPlugin:
                     mvt_path = os.path.join(folder, f'{y}.mvt')
 
                     expired = (
-                        not os.path.exists(mvt_path) or datetime.fromtimestamp(os.path.getmtime(mvt_path)) < (datetime.now() - _CACHE_EXPIRE)
+                        not os.path.exists(mvt_path)
+                        or datetime.fromtimestamp(os.path.getmtime(mvt_path)) < (datetime.now() - _CACHE_EXPIRE)
                     )
                     if expired:
                         url = _build_tile_url(x, y, zoom_level, server_url)
@@ -447,12 +589,9 @@ class MapillaryClickPreviewPlugin:
             for level in LAYER_LEVELS:
                 lyr = layers[level]
                 if lyr and lyr.isValid():
-                    qml_candidates = [os.path.join(os.path.dirname(__file__), 'res', f'mapillary_{level}.qml')]
-
-                    for qml in qml_candidates:
-                        if os.path.exists(qml):
-                            lyr.loadNamedStyle(qml)
-                            break
+                    qml_path = os.path.join(os.path.dirname(__file__), 'res', f'mapillary_{level}.qml')
+                    if os.path.exists(qml_path):
+                        lyr.loadNamedStyle(qml_path)
                     QgsProject.instance().addMapLayer(lyr)
                     self.coverage_layers[level] = lyr
                     added.append(lyr)
@@ -461,7 +600,7 @@ class MapillaryClickPreviewPlugin:
             self.coverage_range_key = range_key
 
             if added:
-                self._apply_year_filter_to_existing_layers()
+                self._apply_filters_to_existing_layers()
                 self._connect_auto_preview_layer(self.coverage_layers.get('image'))
                 QgsMessageLog.logMessage(
                     f'Mapillary coverage loaded: {len(added)} layer(s) at zoom {zoom_level}.',
@@ -469,6 +608,6 @@ class MapillaryClickPreviewPlugin:
             else:
                 self._disconnect_auto_preview_layer()
                 QgsMessageLog.logMessage(
-                    'No Mapillary coverage tiles found for current extent.', 'Mapillary', Qgis.Warning)
+                    'No Mapillary coverage tiles found for current extent/AOI.', 'Mapillary', Qgis.Warning)
         finally:
             self.coverage_refreshing = False
